@@ -4,7 +4,9 @@
 #include <numeric> // std::accumulate
 #include <random>
 #include <stdexcept>
+#include <experimental/simd>
 #include <vector>
+#include <immintrin.h>
 
 struct Input {
   std::size_t bulkSize;
@@ -217,6 +219,153 @@ static void Bulk(benchmark::State &state) {
   SanityCheck(results);
 }
 BENCHMARK(Bulk);
+
+using std::experimental::native_simd;
+
+template<bool sinhViaExp>
+auto sinhSimd(native_simd<float> v) {
+    if constexpr(sinhViaExp) {
+        const auto e = exp(v);
+        return 0.5f * (e - 1.f / e);
+    }
+
+#ifdef __INTEL_LLVM_COMPILER
+    // use Intel's SVML
+#ifdef __AVX2__
+    if constexpr(sizeof(v) == sizeof(__m256)) {
+        const auto r = _mm256_sinh_ps(reinterpret_cast<__m256&>(v));
+        return reinterpret_cast<const native_simd<float>&>(r);
+    }
+#endif
+#ifdef __AVX512F__
+    if constexpr(sizeof(v) == sizeof(__m512)) {
+        const auto r = __m512_sinh_ps(reinterpret_cast<__m512&>(v));
+        return reinterpret_cast<const native_simd<float>&>(r);
+    }
+#endif
+#endif
+
+//    const auto e = exp(v);
+//    return 0.5f * (e - 1.f / e);
+    return sinh(v);
+}
+
+auto sincosSimd(native_simd<float> v) {
+#ifdef __INTEL_LLVM_COMPILER
+    // use Intel's SVML
+    #ifdef __AVX2__
+    if constexpr(sizeof(v) == sizeof(__m256)) {
+        __m256 c;
+        const __m256 s = _mm256_sincos_ps(&c, reinterpret_cast<__m256&>(v));
+        return std::pair{reinterpret_cast<const native_simd<float>&>(s), reinterpret_cast<const native_simd<float>&>(c)};
+    }
+    #endif
+#ifdef __AVX512F__
+    if constexpr(sizeof(v) == sizeof(__m512)) {
+        __m512 c;
+        const __m512 s = _mm512_sincos_ps(&c, reinterpret_cast<__m512&>(v));
+        return std::pair{reinterpret_cast<const native_simd<float>&>(s), reinterpret_cast<const native_simd<float>&>(c)};
+    }
+#endif
+#endif
+    return std::pair{sin(v), cos(v)};
+}
+
+template<bool sinhViaExp, typename T>
+void InvariantMassBulkSimd(const std::vector<bool> &eventMask, std::size_t bulkSize,
+                           std::vector<T> &results, const T *pt, const T *eta,
+                           const T *phi, const T *mass, const std::size_t *sizes) {
+
+    std::size_t elementIdx = 0u;
+
+    constexpr auto simdWidth = native_simd<T>::size();
+
+    std::size_t currentEventId = 0;
+    T x_sum = 0;
+    T y_sum = 0;
+    T z_sum = 0;
+    T e_sum = 0;
+
+    auto completeEvent = [&] {
+        results[currentEventId] = sqrt(e_sum * e_sum - x_sum * x_sum - y_sum * y_sum - z_sum * z_sum);
+        x_sum = 0;
+        y_sum = 0;
+        z_sum = 0;
+        e_sum = 0;
+    };
+
+    int pending = 0;
+    std::array<std::size_t, simdWidth> particleEventIds;
+    native_simd<T> pts;
+    native_simd<T> phis;
+    native_simd<T> etas;
+    native_simd<T> masses;
+
+    auto flushParticles = [&] (int count) {
+        const auto [s, c] = sincosSimd(phis);
+        const native_simd<T> x = pts * c;
+        const native_simd<T> y = pts * s;
+        const native_simd<T> z = pts * sinhSimd<sinhViaExp>(etas);
+        const native_simd<T> e = sqrt(x * x + y * y + z * z + masses * masses);
+
+        for (int i = 0; i < count; i++) {
+            const auto eventId = particleEventIds[i];
+            if (eventId != currentEventId) {
+                completeEvent();
+                currentEventId = eventId;
+            }
+            x_sum += x[i];
+            y_sum += y[i];
+            z_sum += z[i];
+            e_sum += e[i];
+        }
+        pending = 0;
+    };
+
+    for (std::size_t i = 0; i < bulkSize; ++i) {
+        if (eventMask[i]) {
+            for (std::size_t j = 0u; j < sizes[i]; ++j) {
+                particleEventIds[pending] = i;
+                pts[pending] = pt[elementIdx + j];
+                phis[pending] = phi[elementIdx + j];
+                etas[pending] = eta[elementIdx + j];
+                masses[pending] = mass[elementIdx + j];
+                pending++;
+                if (pending == simdWidth)
+                    flushParticles(simdWidth);
+            }
+        }
+        elementIdx += sizes[i];
+    }
+
+    if (pending)
+        flushParticles(pending);
+    completeEvent();
+}
+
+template<bool sinhViaExp>
+void BulkSimd(benchmark::State &state) {
+    std::vector<float> results(input.bulkSize);
+    benchmark::DoNotOptimize(results);
+    for (auto _: state) {
+        InvariantMassBulkSimd<sinhViaExp>(input.eventMask, input.bulkSize, results, input.pts,
+                              input.etas, input.phis, input.masses, input.sizes);
+        // to force writing to memory of results
+        benchmark::ClobberMemory();
+    }
+
+    SanityCheck(results);
+}
+
+static void BulkSimd(benchmark::State &state) {
+    BulkSimd<false>(state);
+}
+BENCHMARK(BulkSimd);
+
+static void BulkSimdSimpleSinh(benchmark::State &state) {
+    BulkSimd<true>(state);
+}
+BENCHMARK(BulkSimdSimpleSinh);
 
 template <typename T>
 void InvariantMassBulkIgnoreMask(const std::vector<bool> &eventMask,

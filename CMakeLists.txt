@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.11)
 project (invmass-benchmark CXX)
-add_compile_options(-Wall -Wextra -Wpedantic)
-set(CMAKE_CXX_STANDARD "17" CACHE STRING "")
+add_compile_options(-Wall -Wextra -Wpedantic -march=native -Wno-tautological-constant-compare)
+set(CMAKE_CXX_STANDARD "20" CACHE STRING "")
 
 if(NOT CMAKE_BUILD_TYPE)
    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
@@ -17,7 +17,7 @@ if (NOT benchmark_FOUND)
    FetchContent_Declare(
       benchmark
       GIT_REPOSITORY https://github.com/google/benchmark
-      GIT_TAG 1.7.1
+      GIT_TAG v1.7.1
    )
    FetchContent_Populate(benchmark)
    set(BENCHMARK_DOWNLOAD_DEPENDENCIES ON CACHE BOOL "Download gtest if needed")
